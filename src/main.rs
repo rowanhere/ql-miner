@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 const WALLET_HEX_LEN: usize = 3904;
 const BATCH_PER_WORKER: u64 = 1_000_000;
-const CUDA_BATCH_NONCES: u64 = 64_000_000;
+const CUDA_BATCH_NONCES: u64 = 1_024_000_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -168,8 +168,8 @@ fn main() {
         if cuda_enabled {
             match mine_cuda_batch(&template, &wallet, cuda_device) {
                 Ok(result) => {
-                    print!(
-                        "\r[CUDA] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
+                    println!(
+                        "[CUDA] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
                         template.block_height,
                         format_target(template.difficulty_bits),
                         format_hashes(result.checked as f64),
@@ -179,10 +179,8 @@ fn main() {
                         format_duration(expected_hashes(template.difficulty_bits) / result.rate.max(0.001)),
                         result.start_nonce
                     );
-                    let _ = io::stdout().flush();
 
                     if let Some(nonce) = result.nonce {
-                        println!();
                         println!(
                             "[MINER] SOLVED block {} | nonce={} | checked={} | elapsed={} | avg={}",
                             template.block_height,
