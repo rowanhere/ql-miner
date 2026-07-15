@@ -61,7 +61,7 @@ fn default_difficulty_bits() -> u32 {
 
 fn usage() -> ! {
     eprintln!(
-        "Usage: ql-miner-multicore [--cuda] [--cuda-device ID] [-j WORKERS] NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX"
+        "Usage: ql-miner-multicore [--cuda] [--cuda-device ID|--cuda-devices 0,1] [-j WORKERS] NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX"
     );
     std::process::exit(2);
 }
@@ -70,7 +70,7 @@ fn main() {
     let args = env::args().skip(1).collect::<Vec<String>>();
     let mut workers = num_cpus::get();
     let mut cuda_enabled = false;
-    let mut cuda_device = 0i32;
+    let mut cuda_devices = vec![0i32];
     let mut positional = Vec::new();
 
     let mut i = 0usize;
@@ -89,7 +89,17 @@ fn main() {
                 if i >= args.len() {
                     usage();
                 }
-                cuda_device = args[i].parse::<i32>().unwrap_or_else(|_| usage());
+                cuda_devices = vec![args[i].parse::<i32>().unwrap_or_else(|_| usage())];
+            }
+            "--cuda-devices" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                cuda_devices = parse_cuda_devices(&args[i]).unwrap_or_else(|err| {
+                    eprintln!("[MINER] {err}");
+                    usage();
+                });
             }
             "-h" | "--help" => usage(),
             value => positional.push(value.to_string()),
@@ -132,7 +142,10 @@ fn main() {
     println!("[CONFIG] Connecting to node: {node}");
     println!("[MINER] Mining rewards will be paid to: {wallet_hex}");
     if cuda_enabled {
-        println!("[MINER] Using CUDA device {cuda_device}. Press Ctrl+C to stop.");
+        println!(
+            "[MINER] Using CUDA device(s) {}. Press Ctrl+C to stop.",
+            format_cuda_devices(&cuda_devices)
+        );
     } else {
         println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
     }
@@ -173,7 +186,7 @@ fn main() {
         }
 
         if cuda_enabled {
-            match mine_cuda_batch(&template, &wallet, cuda_device) {
+            match mine_cuda_devices_batch(&template, &wallet, &cuda_devices) {
                 Ok(result) => {
                     total_checked = total_checked.saturating_add(result.checked);
                     let avg_rate =
@@ -182,7 +195,7 @@ fn main() {
 
                     render_dashboard(&Dashboard {
                         mode: "CUDA",
-                        device: format!("GPU {cuda_device}"),
+                        device: format!("GPU {}", format_cuda_devices(&cuda_devices)),
                         endpoint: &active_endpoint_label,
                         block_height: template.block_height,
                         target_bits: template.difficulty_bits,
@@ -192,6 +205,7 @@ fn main() {
                         elapsed: miner_started.elapsed().as_secs_f64(),
                         eta,
                         start_nonce: result.start_nonce,
+                        found_device: result.found_device,
                         total_blocks_found,
                         blocks_found: &blocks_found,
                     });
@@ -212,7 +226,7 @@ fn main() {
 
                         render_dashboard(&Dashboard {
                             mode: "CUDA",
-                            device: format!("GPU {cuda_device}"),
+                            device: format!("GPU {}", format_cuda_devices(&cuda_devices)),
                             endpoint: &active_endpoint_label,
                             block_height: template.block_height,
                             target_bits: template.difficulty_bits,
@@ -222,13 +236,18 @@ fn main() {
                             elapsed: miner_started.elapsed().as_secs_f64(),
                             eta,
                             start_nonce: result.start_nonce,
+                            found_device: result.found_device,
                             total_blocks_found,
                             blocks_found: &blocks_found,
                         });
                         println!(
-                            "[MINER] SOLVED block {} | nonce={} | submit={}",
+                            "[MINER] SOLVED block {} | nonce={} | gpu={} | submit={}",
                             template.block_height,
                             nonce,
+                            result
+                                .found_device
+                                .map(|device| device.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
                             blocks_found
                                 .first()
                                 .map(|block| block.status.as_str())
@@ -325,6 +344,7 @@ fn main() {
                                 elapsed: miner_started.elapsed().as_secs_f64(),
                                 eta,
                                 start_nonce: first_nonce.unwrap_or(0),
+                                found_device: None,
                                 total_blocks_found,
                                 blocks_found: &blocks_found,
                             });
@@ -373,6 +393,7 @@ fn main() {
                 elapsed: miner_started.elapsed().as_secs_f64(),
                 eta: expected_hashes(template.difficulty_bits) / avg_rate.max(0.001),
                 start_nonce: first_nonce.unwrap_or(0),
+                found_device: None,
                 total_blocks_found,
                 blocks_found: &blocks_found,
             });
@@ -403,6 +424,7 @@ struct Dashboard<'a> {
     elapsed: f64,
     eta: f64,
     start_nonce: u64,
+    found_device: Option<i32>,
     total_blocks_found: u64,
     blocks_found: &'a [FoundBlock],
 }
@@ -440,6 +462,9 @@ fn render_dashboard(dashboard: &Dashboard) {
         format_duration(dashboard.elapsed),
         dashboard.start_nonce
     );
+    if let Some(device) = dashboard.found_device {
+        println!("Last Found GPU: {device}");
+    }
     println!("--------------------------------------------------------------");
     println!("Blocks Found: {}", dashboard.total_blocks_found);
     println!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status");
@@ -480,6 +505,100 @@ struct CudaBatchResult {
     elapsed: f64,
     rate: f64,
     start_nonce: u64,
+    found_device: Option<i32>,
+}
+
+fn parse_cuda_devices(value: &str) -> Result<Vec<i32>, String> {
+    let mut devices = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let device = part
+            .parse::<i32>()
+            .map_err(|_| format!("invalid CUDA device id: {part}"))?;
+        devices.push(device);
+    }
+
+    if devices.is_empty() {
+        return Err("at least one CUDA device is required".to_string());
+    }
+
+    devices.sort_unstable();
+    devices.dedup();
+    Ok(devices)
+}
+
+fn format_cuda_devices(devices: &[i32]) -> String {
+    devices
+        .iter()
+        .map(|device| device.to_string())
+        .collect::<Vec<String>>()
+        .join(",")
+}
+
+fn mine_cuda_devices_batch(
+    template: &Template,
+    wallet: &[u8],
+    devices: &[i32],
+) -> Result<CudaBatchResult, String> {
+    if devices.len() == 1 {
+        return mine_cuda_batch(template, wallet, devices[0]);
+    }
+
+    let started = Instant::now();
+    let (tx, rx) = mpsc::channel();
+
+    for &device_id in devices {
+        let tx = tx.clone();
+        let template = template.clone();
+        let wallet = wallet.to_vec();
+        thread::spawn(move || {
+            let result = mine_cuda_batch(&template, &wallet, device_id);
+            let _ = tx.send((device_id, result));
+        });
+    }
+    drop(tx);
+
+    let mut checked = 0u64;
+    let mut first_start_nonce = 0u64;
+    let mut winning_nonce = None;
+    let mut winning_device = None;
+    let mut errors = Vec::new();
+
+    for (device_id, result) in rx {
+        match result {
+            Ok(result) => {
+                if first_start_nonce == 0 {
+                    first_start_nonce = result.start_nonce;
+                }
+                checked = checked.saturating_add(result.checked);
+                if winning_nonce.is_none() {
+                    if let Some(nonce) = result.nonce {
+                        winning_nonce = Some(nonce);
+                        winning_device = Some(device_id);
+                    }
+                }
+            }
+            Err(err) => errors.push(format!("GPU {device_id}: {err}")),
+        }
+    }
+
+    if checked == 0 && !errors.is_empty() {
+        return Err(errors.join(" | "));
+    }
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let rate = checked as f64 / elapsed.max(0.001);
+    Ok(CudaBatchResult {
+        nonce: winning_nonce,
+        checked,
+        elapsed,
+        rate,
+        start_nonce: first_start_nonce,
+        found_device: winning_device,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -522,6 +641,7 @@ fn mine_cuda_batch(
             elapsed,
             rate,
             start_nonce,
+            found_device: Some(device_id),
         }),
         0 => Ok(CudaBatchResult {
             nonce: None,
@@ -529,6 +649,7 @@ fn mine_cuda_batch(
             elapsed,
             rate,
             start_nonce,
+            found_device: None,
         }),
         code => Err(format!("CUDA miner failed with code {code}")),
     }

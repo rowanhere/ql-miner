@@ -44,6 +44,12 @@ To mine on an NVIDIA GPU:
 ./target/release/ql-miner-multicore --cuda --cuda-device 0 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
 ```
 
+To mine on multiple NVIDIA GPUs from one process:
+
+```bash
+./target/release/ql-miner-multicore --cuda --cuda-devices 0,1 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
+```
+
 The miner prints a clear terminal dashboard for SSH/VPS sessions, with block
 height, block target, current hashrate, average hashrate, checked hashes, ETA,
 uptime, and a latest-blocks-found table. When it finds a match it prints a
@@ -70,6 +76,12 @@ CUDA script:
 ```bash
 chmod +x run-vps.sh
 ./run-vps.sh --cuda
+```
+
+Multiple GPUs:
+
+```bash
+CUDA_DEVICES=0,1 ./run-vps.sh --cuda
 ```
 
 Manual command:
