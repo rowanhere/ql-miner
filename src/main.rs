@@ -127,6 +127,7 @@ fn main() {
         eprintln!("[MINER] That doesn't look like a valid address.");
         std::process::exit(2);
     });
+    let wallet_short = abbreviate_address(&wallet_hex);
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -197,6 +198,7 @@ fn main() {
                     render_dashboard(&Dashboard {
                         mode: "CUDA",
                         device: format!("GPU {}", format_cuda_devices(&cuda_devices)),
+                        miner: &wallet_short,
                         endpoint: &active_endpoint_label,
                         block_height: template.block_height,
                         target_bits: template.difficulty_bits,
@@ -232,6 +234,7 @@ fn main() {
                         render_dashboard(&Dashboard {
                             mode: "CUDA",
                             device: format!("GPU {}", format_cuda_devices(&cuda_devices)),
+                            miner: &wallet_short,
                             endpoint: &active_endpoint_label,
                             block_height: template.block_height,
                             target_bits: template.difficulty_bits,
@@ -341,6 +344,7 @@ fn main() {
                             render_dashboard(&Dashboard {
                                 mode: "CPU",
                                 device: format!("{workers} threads"),
+                                miner: &wallet_short,
                                 endpoint: &active_endpoint_label,
                                 block_height: template.block_height,
                                 target_bits: template.difficulty_bits,
@@ -393,6 +397,7 @@ fn main() {
             render_dashboard(&Dashboard {
                 mode: "CPU",
                 device: format!("{workers} threads"),
+                miner: &wallet_short,
                 endpoint: &active_endpoint_label,
                 block_height: template.block_height,
                 target_bits: template.difficulty_bits,
@@ -426,6 +431,7 @@ struct FoundBlock {
 struct Dashboard<'a> {
     mode: &'a str,
     device: String,
+    miner: &'a str,
     endpoint: &'a str,
     block_height: u64,
     target_bits: u32,
@@ -445,10 +451,13 @@ fn render_dashboard(dashboard: &Dashboard) {
     print!("\x1b[2J\x1b[H");
     println!("QL MINER - SRB STYLE STATUS");
     println!("==============================================================");
-    println!("{:<18} {:<18} {:<18}", "Mode", "Device", "RPC Endpoint");
     println!(
-        "{:<18} {:<18} {:<18}",
-        dashboard.mode, dashboard.device, dashboard.endpoint
+        "{:<18} {:<18} {:<18} {:<18}",
+        "Mode", "Device", "Miner", "RPC Endpoint"
+    );
+    println!(
+        "{:<18} {:<18} {:<18} {:<18}",
+        dashboard.mode, dashboard.device, dashboard.miner, dashboard.endpoint
     );
     println!("--------------------------------------------------------------");
     println!(
@@ -502,6 +511,14 @@ fn render_dashboard(dashboard: &Dashboard) {
 
 fn compact_status(status: &str) -> String {
     status.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn abbreviate_address(address: &str) -> String {
+    if address.len() <= 8 {
+        return address.to_string();
+    }
+
+    format!("{}...{}", &address[..4], &address[address.len() - 4..])
 }
 
 fn truncate_for_table(value: &str, max_len: usize) -> String {
