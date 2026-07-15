@@ -155,7 +155,8 @@ fn main() {
     let miner_started = Instant::now();
     let mut total_checked = 0u64;
     let mut last_dashboard = Instant::now();
-    let mut total_blocks_found = 0u64;
+    let mut total_solutions_found = 0u64;
+    let mut total_blocks_accepted = 0u64;
     let mut blocks_found = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
@@ -206,13 +207,17 @@ fn main() {
                         eta,
                         start_nonce: result.start_nonce,
                         found_device: result.found_device,
-                        total_blocks_found,
+                        total_solutions_found,
+                        total_blocks_accepted,
                         blocks_found: &blocks_found,
                     });
 
                     if let Some(nonce) = result.nonce {
-                        total_blocks_found = total_blocks_found.saturating_add(1);
+                        total_solutions_found = total_solutions_found.saturating_add(1);
                         let submit_status = submit_nonce_with_retry(&endpoint, &wallet_hex, nonce);
+                        if is_accepted_status(&submit_status) {
+                            total_blocks_accepted = total_blocks_accepted.saturating_add(1);
+                        }
 
                         blocks_found.insert(
                             0,
@@ -237,7 +242,8 @@ fn main() {
                             eta,
                             start_nonce: result.start_nonce,
                             found_device: result.found_device,
-                            total_blocks_found,
+                            total_solutions_found,
+                            total_blocks_accepted,
                             blocks_found: &blocks_found,
                         });
                         println!(
@@ -345,7 +351,8 @@ fn main() {
                                 eta,
                                 start_nonce: first_nonce.unwrap_or(0),
                                 found_device: None,
-                                total_blocks_found,
+                                total_solutions_found,
+                                total_blocks_accepted,
                                 blocks_found: &blocks_found,
                             });
                             last_dashboard = Instant::now();
@@ -367,8 +374,11 @@ fn main() {
         total_checked = total_checked.saturating_add(checked.load(Ordering::Relaxed));
 
         if let Some(nonce) = winning_nonce {
-            total_blocks_found = total_blocks_found.saturating_add(1);
+            total_solutions_found = total_solutions_found.saturating_add(1);
             let submit_status = submit_nonce_with_retry(&endpoint, &wallet_hex, nonce);
+            if is_accepted_status(&submit_status) {
+                total_blocks_accepted = total_blocks_accepted.saturating_add(1);
+            }
             blocks_found.insert(
                 0,
                 FoundBlock {
@@ -394,7 +404,8 @@ fn main() {
                 eta: expected_hashes(template.difficulty_bits) / avg_rate.max(0.001),
                 start_nonce: first_nonce.unwrap_or(0),
                 found_device: None,
-                total_blocks_found,
+                total_solutions_found,
+                total_blocks_accepted,
                 blocks_found: &blocks_found,
             });
         }
@@ -425,7 +436,8 @@ struct Dashboard<'a> {
     eta: f64,
     start_nonce: u64,
     found_device: Option<i32>,
-    total_blocks_found: u64,
+    total_solutions_found: u64,
+    total_blocks_accepted: u64,
     blocks_found: &'a [FoundBlock],
 }
 
@@ -466,7 +478,10 @@ fn render_dashboard(dashboard: &Dashboard) {
         println!("Last Found GPU: {device}");
     }
     println!("--------------------------------------------------------------");
-    println!("Blocks Found: {}", dashboard.total_blocks_found);
+    println!(
+        "Solutions Found: {} | Accepted Blocks: {}",
+        dashboard.total_solutions_found, dashboard.total_blocks_accepted
+    );
     println!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status");
     if dashboard.blocks_found.is_empty() {
         println!("{:<10} {:<22} {:<28}", "-", "-", "none yet");
@@ -805,11 +820,52 @@ fn submit_nonce_with_retry(endpoint: &Endpoint, wallet: &str, nonce: u64) -> Str
 }
 
 fn classify_submit_body(body: &str) -> String {
-    let lower = body.to_ascii_lowercase();
-    if lower.contains("accepted") || lower.contains("ok") || lower.contains("true") {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if json_value_is_accepted(&value) {
+            return "accepted".to_string();
+        }
+        return format!("response: {}", compact_status(body));
+    }
+
+    let compact = compact_status(body);
+    let lower = compact.to_ascii_lowercase();
+    if matches!(lower.as_str(), "accepted" | "ok" | "true" | "success") {
         "accepted".to_string()
     } else {
-        format!("response: {}", compact_status(body))
+        format!("response: {compact}")
+    }
+}
+
+fn is_accepted_status(status: &str) -> bool {
+    status == "accepted"
+}
+
+fn json_value_is_accepted(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(value) => *value,
+        serde_json::Value::String(value) => {
+            let lower = value.trim().to_ascii_lowercase();
+            matches!(lower.as_str(), "accepted" | "ok" | "true" | "success")
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["accepted", "ok", "success"] {
+                if map.get(key).and_then(serde_json::Value::as_bool) == Some(true) {
+                    return true;
+                }
+            }
+
+            for key in ["status", "result", "message"] {
+                if let Some(value) = map.get(key).and_then(serde_json::Value::as_str) {
+                    let lower = value.trim().to_ascii_lowercase();
+                    if matches!(lower.as_str(), "accepted" | "ok" | "success") {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        }
+        _ => false,
     }
 }
 
