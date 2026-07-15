@@ -10,13 +10,21 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let object = out_dir.join("cuda_miner.o");
     let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
+    let cuda_threads = env::var("CUDA_THREADS").unwrap_or_else(|_| "256".to_string());
 
-    let status = Command::new("nvcc")
-        .arg("-O3")
+    let mut nvcc = Command::new("nvcc");
+    nvcc.arg("-O3")
         .arg("-arch")
         .arg(&cuda_arch)
+        .arg(format!("-DQL_CUDA_THREADS={cuda_threads}"))
         .arg("-Xcompiler")
-        .arg("-fPIC")
+        .arg("-fPIC");
+
+    if let Ok(max_registers) = env::var("CUDA_MAXRREGCOUNT") {
+        nvcc.arg("-maxrregcount").arg(max_registers);
+    }
+
+    let status = nvcc
         .arg("-c")
         .arg("src/cuda_miner.cu")
         .arg("-o")
@@ -40,4 +48,7 @@ fn main() {
         println!("cargo:rustc-link-lib=gcc_s");
     }
     println!("cargo:rerun-if-changed=src/cuda_miner.cu");
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=CUDA_THREADS");
+    println!("cargo:rerun-if-env-changed=CUDA_MAXRREGCOUNT");
 }

@@ -2,6 +2,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifndef QL_CUDA_THREADS
+#define QL_CUDA_THREADS 256
+#endif
+
 static __constant__ uint64_t PREFIX_STATE[25];
 
 static __host__ __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
@@ -156,7 +160,20 @@ static __device__ bool has_leading_zero_bits(uint64_t s[25], uint32_t bits) {
     return true;
 }
 
-static __device__ bool valid_nonce_gpu(
+static __device__ __forceinline__ void absorb_nonce_and_pad(uint64_t s[25], uint32_t prefix_pos, uint64_t nonce) {
+    if (prefix_pos == 124) {
+        s[15] ^= (nonce & 0xffffffffULL) << 32;
+        s[16] ^= (nonce >> 32) ^ (0x06ULL << 32) ^ (0x80ULL << 56);
+        return;
+    }
+
+    uint32_t pos = prefix_pos;
+    absorb_u64_le(s, pos, nonce);
+    s[pos >> 3] ^= ((uint64_t)0x06) << ((pos & 7) * 8);
+    s[(136 - 1) >> 3] ^= ((uint64_t)0x80) << (((136 - 1) & 7) * 8);
+}
+
+static __device__ __forceinline__ bool valid_nonce_gpu(
     uint32_t prefix_pos,
     uint64_t nonce,
     uint32_t difficulty_bits
@@ -167,11 +184,7 @@ static __device__ bool valid_nonce_gpu(
         s[i] = PREFIX_STATE[i];
     }
 
-    uint32_t pos = prefix_pos;
-    absorb_u64_le(s, pos, nonce);
-
-    s[pos >> 3] ^= ((uint64_t)0x06) << ((pos & 7) * 8);
-    s[(136 - 1) >> 3] ^= ((uint64_t)0x80) << (((136 - 1) & 7) * 8);
+    absorb_nonce_and_pad(s, prefix_pos, nonce);
     keccak_f1600(s);
 
     return has_leading_zero_bits(s, difficulty_bits);
@@ -250,7 +263,7 @@ extern "C" int ql_cuda_mine(
     cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &zero_nonce, sizeof(unsigned long long), cudaMemcpyHostToDevice);
 
-    const int threads = 256;
+    const int threads = QL_CUDA_THREADS;
     uint64_t blocks64 = (total_nonces + threads - 1) / threads;
     if (blocks64 < 1) blocks64 = 1;
     if (blocks64 > 65535ULL) blocks64 = 65535ULL;
