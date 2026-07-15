@@ -28,6 +28,11 @@ By default it uses all detected CPU threads. To pick a worker count:
 ./target/release/ql-miner-multicore -j 32 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
 ```
 
+The miner prints a live status line with block number, target difficulty,
+checked hashes, current H/s, average H/s, elapsed time, rough ETA, and the
+starting nonce. When it finds a match it prints a `SOLVED` line before
+submitting the nonce.
+
 The miner defaults to `https://NODE_ADDRESS:PORT`, matching the original
 binary's TLS client behavior. You can pass an explicit `http://` or `https://`
 URL if needed.

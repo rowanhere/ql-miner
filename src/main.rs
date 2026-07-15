@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 const WALLET_HEX_LEN: usize = 3904;
 const BATCH_PER_WORKER: u64 = 250_000;
+const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct Template {
@@ -90,15 +91,20 @@ fn main() {
         };
 
         println!(
-            "[MINER] Got template for block {} mining at {} bits",
-            template.block_height, template.difficulty_bits
+            "[MINER] Block {} | target: {} leading zero bit(s) | expected work: {} hashes",
+            template.block_height,
+            template.difficulty_bits,
+            format_hashes(expected_hashes(template.difficulty_bits))
         );
 
         let started = Instant::now();
+        let mut last_status = Instant::now();
+        let mut last_count = 0u64;
         let checked = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let mut handles = Vec::with_capacity(workers);
+        let mut first_nonce = None;
 
         for worker_id in 0..workers {
             let template = template.clone();
@@ -111,6 +117,9 @@ fn main() {
             handles.push(thread::spawn(move || {
                 let mut rng = rand::thread_rng();
                 let mut nonce = rng.next_u64().wrapping_add(worker_id as u64);
+                if worker_id == 0 {
+                    let _ = tx.send(MinerEvent::StartedAt(nonce));
+                }
 
                 for _ in 0..BATCH_PER_WORKER {
                     if stop.load(Ordering::Relaxed) || found.load(Ordering::Relaxed) {
@@ -119,7 +128,7 @@ fn main() {
 
                     if valid_nonce(&template, &wallet, nonce) {
                         found.store(true, Ordering::Relaxed);
-                        let _ = tx.send(nonce);
+                        let _ = tx.send(MinerEvent::Found(nonce));
                         return;
                     }
 
@@ -133,18 +142,49 @@ fn main() {
 
         let mut winning_nonce = None;
         loop {
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(nonce) => {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(MinerEvent::StartedAt(nonce)) => {
+                    first_nonce = Some(nonce);
+                    println!(
+                        "[MINER] Searching nonce stream from {} across {} worker(s)",
+                        nonce, workers
+                    );
+                }
+                Ok(MinerEvent::Found(nonce)) => {
                     winning_nonce = Some(nonce);
                     break;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let count = checked.load(Ordering::Relaxed);
-                    print!(
-                        "\r[MINER] Checked {count} nonces in {:.1}s",
-                        started.elapsed().as_secs_f32()
-                    );
-                    let _ = io::stdout().flush();
+                    if last_status.elapsed() >= STATUS_INTERVAL {
+                        let elapsed = started.elapsed().as_secs_f64();
+                        let interval = last_status.elapsed().as_secs_f64();
+                        let instant_rate = (count.saturating_sub(last_count)) as f64 / interval;
+                        let average_rate = count as f64 / elapsed.max(0.001);
+                        let expected = expected_hashes(template.difficulty_bits);
+                        let eta = if average_rate > 0.0 {
+                            expected / average_rate
+                        } else {
+                            f64::INFINITY
+                        };
+
+                        print!(
+                            "\r[MINER] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
+                            template.block_height,
+                            format_target(template.difficulty_bits),
+                            format_hashes(count as f64),
+                            format_rate(instant_rate),
+                            format_rate(average_rate),
+                            format_duration(elapsed),
+                            format_duration(eta),
+                            first_nonce
+                                .map(|nonce| nonce.to_string())
+                                .unwrap_or_else(|| "pending".to_string())
+                        );
+                        let _ = io::stdout().flush();
+                        last_status = Instant::now();
+                        last_count = count;
+                    }
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -159,18 +199,45 @@ fn main() {
         println!();
 
         if let Some(nonce) = winning_nonce {
-            println!("[MINER] FOUND nonce {nonce}");
+            println!(
+                "[MINER] SOLVED block {} | nonce={} | checked={} | elapsed={} | avg={}",
+                template.block_height,
+                nonce,
+                format_hashes(checked.load(Ordering::Relaxed) as f64),
+                format_duration(started.elapsed().as_secs_f64()),
+                format_rate(
+                    checked.load(Ordering::Relaxed) as f64
+                        / started.elapsed().as_secs_f64().max(0.001),
+                )
+            );
             match submit_nonce(&client, &base_url, &wallet_hex, nonce) {
-                Ok(body) => println!("[MINER] Submit response: {body}"),
+                Ok(body) => {
+                    let lower = body.to_ascii_lowercase();
+                    if lower.contains("accepted") || lower.contains("ok") || lower.contains("true")
+                    {
+                        println!("[MINER] SUBMIT accepted: {body}");
+                    } else {
+                        println!("[MINER] SUBMIT response: {body}");
+                    }
+                }
                 Err(err) => eprintln!("[MINER] Failed to submit - node unreachable - {err}"),
             }
         } else if !stop.load(Ordering::Relaxed) {
             println!(
-                "[MINER] Batch of {} nonces finished, no match, refetching",
-                checked.load(Ordering::Relaxed)
+                "[MINER] Batch finished | checked={} | avg={} | no match, refetching",
+                format_hashes(checked.load(Ordering::Relaxed) as f64),
+                format_rate(
+                    checked.load(Ordering::Relaxed) as f64
+                        / started.elapsed().as_secs_f64().max(0.001),
+                )
             );
         }
     }
+}
+
+enum MinerEvent {
+    StartedAt(u64),
+    Found(u64),
 }
 
 fn normalize_node_url(node: &str) -> String {
@@ -253,5 +320,62 @@ fn sleep_or_stop(stop: &AtomicBool, duration: Duration) {
     let deadline = Instant::now() + duration;
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn expected_hashes(difficulty_bits: u32) -> f64 {
+    2f64.powi(difficulty_bits.min(255) as i32)
+}
+
+fn format_target(difficulty_bits: u32) -> String {
+    let full_zero_bytes = difficulty_bits / 8;
+    let extra_bits = difficulty_bits % 8;
+
+    if extra_bits == 0 {
+        format!("{difficulty_bits} bits ({full_zero_bytes} zero byte(s))")
+    } else {
+        format!("{difficulty_bits} bits ({full_zero_bytes} zero byte(s) + {extra_bits} bit(s))")
+    }
+}
+
+fn format_hashes(value: f64) -> String {
+    format_scaled(value, "H")
+}
+
+fn format_rate(value: f64) -> String {
+    format!("{}/s", format_scaled(value, "H"))
+}
+
+fn format_scaled(value: f64, suffix: &str) -> String {
+    const UNITS: [&str; 6] = ["", "k", "M", "G", "T", "P"];
+    let mut scaled = value.max(0.0);
+    let mut unit = 0usize;
+
+    while scaled >= 1000.0 && unit < UNITS.len() - 1 {
+        scaled /= 1000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{scaled:.0} {suffix}")
+    } else {
+        format!("{scaled:.2} {}{suffix}", UNITS[unit])
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() {
+        return "unknown".to_string();
+    }
+
+    let seconds = seconds.max(0.0);
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else if seconds < 3600.0 {
+        format!("{:.1}m", seconds / 60.0)
+    } else if seconds < 86_400.0 {
+        format!("{:.1}h", seconds / 3600.0)
+    } else {
+        format!("{:.1}d", seconds / 86_400.0)
     }
 }
