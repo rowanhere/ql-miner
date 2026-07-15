@@ -1,9 +1,11 @@
 use rand::RngCore;
-use reqwest::blocking::Client;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Deserialize;
 use sha3::{Digest, Sha3_256};
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -69,19 +71,16 @@ fn main() {
             .expect("failed to install Ctrl+C handler");
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("ql-miner-multicore/0.1")
-        .build()
-        .expect("failed to build HTTP client");
-
-    let base_urls = node_base_urls(&node);
+    let endpoints = node_endpoints(&node).unwrap_or_else(|err| {
+        eprintln!("[MINER] Bad node address: {err}");
+        std::process::exit(2);
+    });
     println!("[CONFIG] Connecting to node: {node}");
     println!("[MINER] Mining rewards will be paid to: {wallet_hex}");
     println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
 
     while !stop.load(Ordering::Relaxed) {
-        let (base_url, template) = match get_template_from_any(&client, &base_urls) {
+        let (endpoint, template) = match get_template_from_any(&endpoints) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("[MINER] Could not reach node at {node} - {err}");
@@ -210,7 +209,7 @@ fn main() {
                         / started.elapsed().as_secs_f64().max(0.001),
                 )
             );
-            match submit_nonce(&client, &base_url, &wallet_hex, nonce) {
+            match submit_nonce(&endpoint, &wallet_hex, nonce) {
                 Ok(body) => {
                     let lower = body.to_ascii_lowercase();
                     if lower.contains("accepted") || lower.contains("ok") || lower.contains("true")
@@ -240,65 +239,282 @@ enum MinerEvent {
     Found(u64),
 }
 
-fn node_base_urls(node: &str) -> Vec<String> {
-    if node.starts_with("http://") || node.starts_with("https://") {
-        vec![node.trim_end_matches('/').to_string()]
-    } else {
-        let node = node.trim_end_matches('/');
-        vec![format!("https://{node}"), format!("http://{node}")]
+#[derive(Clone)]
+struct Endpoint {
+    scheme: Scheme,
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Copy)]
+enum Scheme {
+    Tls,
+    Plain,
+}
+
+impl Endpoint {
+    fn label(&self) -> String {
+        let scheme = match self.scheme {
+            Scheme::Tls => "tls",
+            Scheme::Plain => "tcp",
+        };
+        format!("{scheme}://{}:{}", self.host, self.port)
     }
 }
 
-fn get_template_from_any(
-    client: &Client,
-    base_urls: &[String],
-) -> Result<(String, Template), Box<dyn std::error::Error>> {
+fn node_endpoints(node: &str) -> Result<Vec<Endpoint>, String> {
+    let node = node.trim().trim_end_matches('/');
+    if let Some(rest) = node.strip_prefix("https://") {
+        let (host, port) = parse_host_port(rest)?;
+        return Ok(vec![Endpoint {
+            scheme: Scheme::Tls,
+            host,
+            port,
+        }]);
+    }
+    if let Some(rest) = node.strip_prefix("http://") {
+        let (host, port) = parse_host_port(rest)?;
+        return Ok(vec![Endpoint {
+            scheme: Scheme::Plain,
+            host,
+            port,
+        }]);
+    }
+
+    let (host, port) = parse_host_port(node)?;
+    let plain = Endpoint {
+        scheme: Scheme::Plain,
+        host: host.clone(),
+        port,
+    };
+    let tls = Endpoint {
+        scheme: Scheme::Tls,
+        host: host.clone(),
+        port,
+    };
+
+    if host == "localhost" || host == "127.0.0.1" {
+        Ok(vec![plain, tls])
+    } else {
+        Ok(vec![tls, plain])
+    }
+}
+
+fn parse_host_port(input: &str) -> Result<(String, u16), String> {
+    let input = input.trim_end_matches('/');
+    let (host, port) = input
+        .rsplit_once(':')
+        .ok_or_else(|| format!("expected NODE_ADDRESS:PORT, got {input}"))?;
+    if host.is_empty() {
+        return Err("host is empty".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port in {input}"))?;
+    Ok((host.to_string(), port))
+}
+
+fn get_template_from_any(endpoints: &[Endpoint]) -> Result<(Endpoint, Template), String> {
     let mut errors = Vec::new();
 
-    for base_url in base_urls {
-        match get_template(client, base_url) {
+    for endpoint in endpoints {
+        match get_template(endpoint) {
             Ok(template) => {
-                println!("[CONFIG] RPC endpoint: {base_url}");
-                return Ok((base_url.clone(), template));
+                println!("[CONFIG] RPC endpoint: {}", endpoint.label());
+                return Ok((endpoint.clone(), template));
             }
-            Err(err) => errors.push(format!("{base_url}: {err}")),
+            Err(err) => errors.push(format!("{}: {err}", endpoint.label())),
         }
     }
 
     Err(errors.join(" | ").into())
 }
 
-fn get_template(client: &Client, base_url: &str) -> Result<Template, Box<dyn std::error::Error>> {
-    let response: TemplateResponse = client
-        .get(format!("{base_url}/api/mining/template"))
-        .send()?
-        .error_for_status()?
-        .json()?;
+fn get_template(endpoint: &Endpoint) -> Result<Template, String> {
+    let body = rpc_request(endpoint, "GET", "/api/mining/template", None)?;
+    let response: TemplateResponse = serde_json::from_str(&body)
+        .map_err(|err| format!("bad template JSON: {err}; body={body}"))?;
 
     Ok(Template {
         block_height: response.block_height,
-        previous_block_hash: hex::decode(response.previous_block_hash)?,
-        merkle_root: hex::decode(response.merkle_root)?,
+        previous_block_hash: hex::decode(response.previous_block_hash)
+            .map_err(|err| format!("bad previous_block_hash: {err}"))?,
+        merkle_root: hex::decode(response.merkle_root)
+            .map_err(|err| format!("bad merkle_root: {err}"))?,
         difficulty_bits: response.difficulty_bits,
     })
 }
 
-fn submit_nonce(
-    client: &Client,
-    base_url: &str,
-    wallet: &str,
-    nonce: u64,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let response = client
-        .post(format!("{base_url}/api/mining/submit"))
-        .json(&serde_json::json!({
-            "miner": wallet,
-            "nonce": nonce,
-        }))
-        .send()?
-        .error_for_status()?;
+fn submit_nonce(endpoint: &Endpoint, wallet: &str, nonce: u64) -> Result<String, String> {
+    let body = serde_json::json!({
+        "miner": wallet,
+        "nonce": nonce,
+    })
+    .to_string();
 
-    Ok(response.text()?)
+    rpc_request(endpoint, "POST", "/api/mining/submit", Some(&body))
+}
+
+fn rpc_request(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let request = build_http_request(endpoint, method, path, body);
+    let response = match endpoint.scheme {
+        Scheme::Plain => send_plain(endpoint, &request),
+        Scheme::Tls => send_tls(endpoint, &request),
+    }?;
+
+    parse_http_response(&response)
+}
+
+fn build_http_request(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Vec<u8> {
+    let body = body.unwrap_or("");
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: ql-miner-multicore/0.1\r\nAccept: application/json\r\nConnection: close\r\n",
+        endpoint.host
+    );
+
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+
+    request.push_str("\r\n");
+    request.push_str(body);
+    request.into_bytes()
+}
+
+fn send_plain(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let mut stream =
+        TcpStream::connect(&address).map_err(|err| format!("tcp connect {address}: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(20)))
+        .map_err(|err| format!("set write timeout: {err}"))?;
+    stream
+        .write_all(request)
+        .map_err(|err| format!("tcp write: {err}"))?;
+
+    read_response(stream, "tcp")
+}
+
+fn send_tls(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let tcp =
+        TcpStream::connect(&address).map_err(|err| format!("tcp connect {address}: {err}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|err| format!("set read timeout: {err}"))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))
+        .map_err(|err| format!("set write timeout: {err}"))?;
+
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = ServerName::try_from(endpoint.host.clone())
+        .map_err(|err| format!("bad TLS server name {}: {err}", endpoint.host))?;
+    let connection = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|err| format!("tls: {err}"))?;
+    let mut stream = StreamOwned::new(connection, tcp);
+
+    stream
+        .write_all(request)
+        .map_err(|err| format!("tls write: {err}"))?;
+
+    read_response(stream, "tls")
+}
+
+fn read_response<R: Read>(mut stream: R, transport: &str) -> Result<Vec<u8>, String> {
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buffer[..n]),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof && !response.is_empty() => {
+                break;
+            }
+            Err(err) => return Err(format!("{transport} read: {err}")),
+        }
+    }
+
+    Ok(response)
+}
+
+fn parse_http_response(response: &[u8]) -> Result<String, String> {
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| format!("invalid HTTP response: {} bytes", response.len()))?;
+    let headers = std::str::from_utf8(&response[..split])
+        .map_err(|err| format!("response headers are not UTF-8: {err}"))?;
+    let body = &response[split + 4..];
+    let mut lines = headers.lines();
+    let status = lines.next().unwrap_or("");
+    let status_code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| format!("invalid HTTP status line: {status}"))?;
+
+    let is_chunked = lines.clone().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.starts_with("transfer-encoding:") && line.contains("chunked")
+    });
+    let body = if is_chunked {
+        decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+    let body =
+        String::from_utf8(body).map_err(|err| format!("response body is not UTF-8: {err}"))?;
+
+    if !(200..300).contains(&status_code) {
+        return Err(format!("HTTP {status_code}: {body}"));
+    }
+
+    Ok(body)
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+
+    loop {
+        let line_end = input
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| "bad chunked response: missing chunk size".to_string())?;
+        let size_line = std::str::from_utf8(&input[..line_end])
+            .map_err(|err| format!("bad chunk size UTF-8: {err}"))?;
+        let size_hex = size_line.split(';').next().unwrap_or(size_line).trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|err| format!("bad chunk size {size_hex}: {err}"))?;
+        input = &input[line_end + 2..];
+
+        if size == 0 {
+            return Ok(out);
+        }
+        if input.len() < size + 2 {
+            return Err("bad chunked response: chunk shorter than declared".to_string());
+        }
+
+        out.extend_from_slice(&input[..size]);
+        input = &input[size + 2..];
+    }
 }
 
 fn valid_nonce(template: &Template, wallet: &[u8], nonce: u64) -> bool {

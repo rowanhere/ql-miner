@@ -8,7 +8,8 @@ ctrlc = "3.4"
 hex = "0.4"
 num_cpus = "1.16"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha3 = "0.10"
+webpki-roots = "1.0"
