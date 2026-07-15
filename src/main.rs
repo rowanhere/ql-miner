@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const WALLET_HEX_LEN: usize = 3904;
-const BATCH_PER_WORKER: u64 = 250_000;
+const BATCH_PER_WORKER: u64 = 1_000_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -80,6 +80,9 @@ fn main() {
     println!("[MINER] Mining rewards will be paid to: {wallet_hex}");
     println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
 
+    let mut active_endpoint_label = String::new();
+    let mut active_block = None;
+
     while !stop.load(Ordering::Relaxed) {
         let (endpoint, template) = match get_template_from_any(&endpoints) {
             Ok(result) => result,
@@ -90,12 +93,22 @@ fn main() {
             }
         };
 
-        println!(
-            "[MINER] Block {} | target: {} leading zero bit(s) | expected work: {} hashes",
-            template.block_height,
-            template.difficulty_bits,
-            format_hashes(expected_hashes(template.difficulty_bits))
-        );
+        let endpoint_label = endpoint.label();
+        if endpoint_label != active_endpoint_label {
+            println!("[CONFIG] RPC endpoint: {endpoint_label}");
+            active_endpoint_label = endpoint_label;
+        }
+
+        let block_key = (template.block_height, template.difficulty_bits);
+        if active_block != Some(block_key) {
+            println!(
+                "[MINER] Block {} | target: {} leading zero bit(s) | expected work: {} hashes",
+                template.block_height,
+                template.difficulty_bits,
+                format_hashes(expected_hashes(template.difficulty_bits))
+            );
+            active_block = Some(block_key);
+        }
 
         let started = Instant::now();
         let mut last_status = Instant::now();
@@ -145,10 +158,6 @@ fn main() {
             match rx.recv_timeout(Duration::from_millis(250)) {
                 Ok(MinerEvent::StartedAt(nonce)) => {
                     first_nonce = Some(nonce);
-                    println!(
-                        "[MINER] Searching nonce stream from {} across {} worker(s)",
-                        nonce, workers
-                    );
                 }
                 Ok(MinerEvent::Found(nonce)) => {
                     winning_nonce = Some(nonce);
@@ -222,15 +231,6 @@ fn main() {
                 }
                 Err(err) => eprintln!("[MINER] Failed to submit - node unreachable - {err}"),
             }
-        } else if !stop.load(Ordering::Relaxed) {
-            println!(
-                "[MINER] Batch finished | checked={} | avg={} | no match, refetching",
-                format_hashes(checked.load(Ordering::Relaxed) as f64),
-                format_rate(
-                    checked.load(Ordering::Relaxed) as f64
-                        / started.elapsed().as_secs_f64().max(0.001),
-                )
-            );
         }
     }
 }
@@ -319,12 +319,8 @@ fn get_template_from_any(endpoints: &[Endpoint]) -> Result<(Endpoint, Template),
     let mut errors = Vec::new();
 
     for endpoint in endpoints {
-        println!("[CONFIG] Trying RPC endpoint: {}", endpoint.label());
         match get_template(endpoint) {
-            Ok(template) => {
-                println!("[CONFIG] RPC endpoint: {}", endpoint.label());
-                return Ok((endpoint.clone(), template));
-            }
+            Ok(template) => return Ok((endpoint.clone(), template)),
             Err(err) => errors.push(format!("{}: {err}", endpoint.label())),
         }
     }
