@@ -5,7 +5,7 @@ use serde::Deserialize;
 use sha3::{Digest, Sha3_256};
 use std::env;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 const WALLET_HEX_LEN: usize = 3904;
 const BATCH_PER_WORKER: u64 = 250_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct Template {
@@ -318,6 +319,7 @@ fn get_template_from_any(endpoints: &[Endpoint]) -> Result<(Endpoint, Template),
     let mut errors = Vec::new();
 
     for endpoint in endpoints {
+        println!("[CONFIG] Trying RPC endpoint: {}", endpoint.label());
         match get_template(endpoint) {
             Ok(template) => {
                 println!("[CONFIG] RPC endpoint: {}", endpoint.label());
@@ -393,9 +395,7 @@ fn build_http_request(
 }
 
 fn send_plain(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
-    let address = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream =
-        TcpStream::connect(&address).map_err(|err| format!("tcp connect {address}: {err}"))?;
+    let mut stream = connect_tcp(endpoint)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|err| format!("set read timeout: {err}"))?;
@@ -410,9 +410,7 @@ fn send_plain(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn send_tls(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
-    let address = format!("{}:{}", endpoint.host, endpoint.port);
-    let tcp =
-        TcpStream::connect(&address).map_err(|err| format!("tcp connect {address}: {err}"))?;
+    let tcp = connect_tcp(endpoint)?;
     tcp.set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|err| format!("set read timeout: {err}"))?;
     tcp.set_write_timeout(Some(Duration::from_secs(20)))
@@ -435,6 +433,32 @@ fn send_tls(endpoint: &Endpoint, request: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("tls write: {err}"))?;
 
     read_response(stream, "tls")
+}
+
+fn connect_tcp(endpoint: &Endpoint) -> Result<TcpStream, String> {
+    let address = format!("{}:{}", endpoint.host, endpoint.port);
+    let addresses = address
+        .to_socket_addrs()
+        .map_err(|err| format!("resolve {address}: {err}"))?
+        .collect::<Vec<SocketAddr>>();
+
+    if addresses.is_empty() {
+        return Err(format!("resolve {address}: no addresses"));
+    }
+
+    let mut errors = Vec::new();
+    for socket_addr in addresses {
+        match TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => errors.push(format!("{socket_addr}: {err}")),
+        }
+    }
+
+    Err(format!(
+        "tcp connect {address} timed out/failed after {}s: {}",
+        CONNECT_TIMEOUT.as_secs(),
+        errors.join(" | ")
+    ))
 }
 
 fn read_response<R: Read>(mut stream: R, transport: &str) -> Result<Vec<u8>, String> {

@@ -41,10 +41,8 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -x ./target/release/ql-miner-multicore ]; then
-  echo "[RUN] Building release miner..."
-  cargo build --release
-fi
+echo "[RUN] Building release miner..."
+cargo build --release
 
 echo "[RUN] Node: $NODE"
 echo "[RUN] Threads: $THREADS"
