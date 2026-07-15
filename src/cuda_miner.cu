@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+static __constant__ uint64_t PREFIX_STATE[25];
+
 static __host__ __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
     return (x << n) | (x >> (64 - n));
 }
@@ -133,19 +135,28 @@ static __host__ __device__ void absorb_u64_le(uint64_t s[25], uint32_t &pos, uin
 }
 
 static __device__ bool has_leading_zero_bits(uint64_t s[25], uint32_t bits) {
-    for (uint32_t i = 0; i < bits; ++i) {
-        uint32_t byte_index = i >> 3;
-        uint32_t bit_in_byte = 7 - (i & 7);
-        uint8_t byte = (uint8_t)(s[byte_index >> 3] >> ((byte_index & 7) * 8));
-        if (((byte >> bit_in_byte) & 1) != 0) {
+    uint32_t full_bytes = bits >> 3;
+    uint32_t extra_bits = bits & 7;
+
+    for (uint32_t i = 0; i < full_bytes; ++i) {
+        uint8_t byte = (uint8_t)(s[i >> 3] >> ((i & 7) * 8));
+        if (byte != 0) {
             return false;
         }
     }
+
+    if (extra_bits != 0) {
+        uint8_t byte = (uint8_t)(s[full_bytes >> 3] >> ((full_bytes & 7) * 8));
+        uint8_t mask = (uint8_t)(0xffu << (8 - extra_bits));
+        if ((byte & mask) != 0) {
+            return false;
+        }
+    }
+
     return true;
 }
 
 static __device__ bool valid_nonce_gpu(
-    const uint64_t *prefix_state,
     uint32_t prefix_pos,
     uint64_t nonce,
     uint32_t difficulty_bits
@@ -153,7 +164,7 @@ static __device__ bool valid_nonce_gpu(
     uint64_t s[25];
     #pragma unroll
     for (int i = 0; i < 25; ++i) {
-        s[i] = prefix_state[i];
+        s[i] = PREFIX_STATE[i];
     }
 
     uint32_t pos = prefix_pos;
@@ -167,7 +178,6 @@ static __device__ bool valid_nonce_gpu(
 }
 
 __global__ void mine_kernel(
-    const uint64_t *prefix_state,
     uint32_t prefix_pos,
     uint32_t difficulty_bits,
     uint64_t start_nonce,
@@ -177,15 +187,15 @@ __global__ void mine_kernel(
 ) {
     uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint32_t poll = 0;
 
     for (; index < total_nonces; index += stride) {
-        if (atomicAdd(found_flag, 0) != 0) {
+        if ((poll++ & 255u) == 0 && *(volatile int *)found_flag != 0) {
             return;
         }
 
         uint64_t nonce = start_nonce + index;
         if (valid_nonce_gpu(
-                prefix_state,
                 prefix_pos,
                 nonce,
                 difficulty_bits
@@ -228,17 +238,15 @@ extern "C" int ql_cuda_mine(
     absorb_u64_le(prefix_state, prefix_pos, block_height);
     absorb_bytes(prefix_state, prefix_pos, wallet, wallet_len);
 
-    uint64_t *d_prefix_state = nullptr;
     unsigned long long *d_found_nonce = nullptr;
     int *d_found_flag = nullptr;
 
-    if (cudaMalloc((void **)&d_prefix_state, sizeof(prefix_state)) != cudaSuccess) return -2;
+    if (cudaMemcpyToSymbol(PREFIX_STATE, prefix_state, sizeof(prefix_state)) != cudaSuccess) return -2;
     if (cudaMalloc((void **)&d_found_nonce, sizeof(unsigned long long)) != cudaSuccess) return -5;
     if (cudaMalloc((void **)&d_found_flag, sizeof(int)) != cudaSuccess) return -6;
 
     int zero = 0;
     unsigned long long zero_nonce = 0;
-    cudaMemcpy(d_prefix_state, prefix_state, sizeof(prefix_state), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &zero_nonce, sizeof(unsigned long long), cudaMemcpyHostToDevice);
 
@@ -249,7 +257,6 @@ extern "C" int ql_cuda_mine(
     int blocks = (int)blocks64;
 
     mine_kernel<<<blocks, threads>>>(
-        d_prefix_state,
         prefix_pos,
         difficulty_bits,
         start_nonce,
@@ -260,7 +267,6 @@ extern "C" int ql_cuda_mine(
 
     cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess) {
-        cudaFree(d_prefix_state);
         cudaFree(d_found_nonce);
         cudaFree(d_found_flag);
         return -7;
@@ -268,7 +274,6 @@ extern "C" int ql_cuda_mine(
 
     cudaError_t sync_status = cudaDeviceSynchronize();
     if (sync_status != cudaSuccess) {
-        cudaFree(d_prefix_state);
         cudaFree(d_found_nonce);
         cudaFree(d_found_flag);
         return -8;
@@ -279,7 +284,6 @@ extern "C" int ql_cuda_mine(
     cudaMemcpy(&h_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&h_nonce, d_found_nonce, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_prefix_state);
     cudaFree(d_found_nonce);
     cudaFree(d_found_flag);
 
