@@ -75,14 +75,14 @@ fn main() {
         .build()
         .expect("failed to build HTTP client");
 
-    let base_url = normalize_node_url(&node);
+    let base_urls = node_base_urls(&node);
     println!("[CONFIG] Connecting to node: {node}");
     println!("[MINER] Mining rewards will be paid to: {wallet_hex}");
     println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
 
     while !stop.load(Ordering::Relaxed) {
-        let template = match get_template(&client, &base_url) {
-            Ok(template) => template,
+        let (base_url, template) = match get_template_from_any(&client, &base_urls) {
+            Ok(result) => result,
             Err(err) => {
                 eprintln!("[MINER] Could not reach node at {node} - {err}");
                 sleep_or_stop(&stop, Duration::from_secs(5));
@@ -240,12 +240,32 @@ enum MinerEvent {
     Found(u64),
 }
 
-fn normalize_node_url(node: &str) -> String {
+fn node_base_urls(node: &str) -> Vec<String> {
     if node.starts_with("http://") || node.starts_with("https://") {
-        node.trim_end_matches('/').to_string()
+        vec![node.trim_end_matches('/').to_string()]
     } else {
-        format!("https://{}", node.trim_end_matches('/'))
+        let node = node.trim_end_matches('/');
+        vec![format!("https://{node}"), format!("http://{node}")]
     }
+}
+
+fn get_template_from_any(
+    client: &Client,
+    base_urls: &[String],
+) -> Result<(String, Template), Box<dyn std::error::Error>> {
+    let mut errors = Vec::new();
+
+    for base_url in base_urls {
+        match get_template(client, base_url) {
+            Ok(template) => {
+                println!("[CONFIG] RPC endpoint: {base_url}");
+                return Ok((base_url.clone(), template));
+            }
+            Err(err) => errors.push(format!("{base_url}: {err}")),
+        }
+    }
+
+    Err(errors.join(" | ").into())
 }
 
 fn get_template(client: &Client, base_url: &str) -> Result<Template, Box<dyn std::error::Error>> {

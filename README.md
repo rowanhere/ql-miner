@@ -33,9 +33,9 @@ checked hashes, current H/s, average H/s, elapsed time, rough ETA, and the
 starting nonce. When it finds a match it prints a `SOLVED` line before
 submitting the nonce.
 
-The miner defaults to `https://NODE_ADDRESS:PORT`, matching the original
-binary's TLS client behavior. You can pass an explicit `http://` or `https://`
-URL if needed.
+If you pass a bare `NODE_ADDRESS:PORT`, the miner tries HTTPS first and then
+HTTP. The bundled `run-vps.sh` uses `http://quantum-lattice.futuristicai.co.za:8034`
+because that RPC port may not accept TLS.
 
 ## My VPS Command
 
