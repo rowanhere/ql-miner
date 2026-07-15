@@ -137,6 +137,11 @@ fn main() {
 
     let mut active_endpoint_label = String::new();
     let mut active_block = None;
+    let miner_started = Instant::now();
+    let mut total_checked = 0u64;
+    let mut last_dashboard = Instant::now();
+    let mut total_blocks_found = 0u64;
+    let mut blocks_found = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         let (endpoint, template) = match get_template_from_any(&endpoints) {
@@ -168,43 +173,78 @@ fn main() {
         if cuda_enabled {
             match mine_cuda_batch(&template, &wallet, cuda_device) {
                 Ok(result) => {
-                    println!(
-                        "[CUDA] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
-                        template.block_height,
-                        format_target(template.difficulty_bits),
-                        format_hashes(result.checked as f64),
-                        format_rate(result.rate),
-                        format_rate(result.rate),
-                        format_duration(result.elapsed),
-                        format_duration(expected_hashes(template.difficulty_bits) / result.rate.max(0.001)),
-                        result.start_nonce
-                    );
+                    total_checked = total_checked.saturating_add(result.checked);
+                    let avg_rate =
+                        total_checked as f64 / miner_started.elapsed().as_secs_f64().max(0.001);
+                    let eta = expected_hashes(template.difficulty_bits) / avg_rate.max(0.001);
+
+                    render_dashboard(&Dashboard {
+                        mode: "CUDA",
+                        device: format!("GPU {cuda_device}"),
+                        endpoint: &active_endpoint_label,
+                        block_height: template.block_height,
+                        target_bits: template.difficulty_bits,
+                        current_rate: result.rate,
+                        average_rate: avg_rate,
+                        checked: total_checked,
+                        elapsed: miner_started.elapsed().as_secs_f64(),
+                        eta,
+                        start_nonce: result.start_nonce,
+                        total_blocks_found,
+                        blocks_found: &blocks_found,
+                    });
 
                     if let Some(nonce) = result.nonce {
-                        println!(
-                            "[MINER] SOLVED block {} | nonce={} | checked={} | elapsed={} | avg={}",
-                            template.block_height,
-                            nonce,
-                            format_hashes(result.checked as f64),
-                            format_duration(result.elapsed),
-                            format_rate(result.rate),
-                        );
-                        match submit_nonce(&endpoint, &wallet_hex, nonce) {
+                        total_blocks_found = total_blocks_found.saturating_add(1);
+                        let submit_status = match submit_nonce(&endpoint, &wallet_hex, nonce) {
                             Ok(body) => {
                                 let lower = body.to_ascii_lowercase();
                                 if lower.contains("accepted")
                                     || lower.contains("ok")
                                     || lower.contains("true")
                                 {
-                                    println!("[MINER] SUBMIT accepted: {body}");
+                                    "accepted".to_string()
                                 } else {
-                                    println!("[MINER] SUBMIT response: {body}");
+                                    format!("response: {}", compact_status(&body))
                                 }
                             }
-                            Err(err) => {
-                                eprintln!("[MINER] Failed to submit - node unreachable - {err}")
-                            }
-                        }
+                            Err(err) => format!("submit failed: {err}"),
+                        };
+
+                        blocks_found.insert(
+                            0,
+                            FoundBlock {
+                                block_height: template.block_height,
+                                nonce,
+                                status: submit_status,
+                            },
+                        );
+                        blocks_found.truncate(8);
+
+                        render_dashboard(&Dashboard {
+                            mode: "CUDA",
+                            device: format!("GPU {cuda_device}"),
+                            endpoint: &active_endpoint_label,
+                            block_height: template.block_height,
+                            target_bits: template.difficulty_bits,
+                            current_rate: result.rate,
+                            average_rate: avg_rate,
+                            checked: total_checked,
+                            elapsed: miner_started.elapsed().as_secs_f64(),
+                            eta,
+                            start_nonce: result.start_nonce,
+                            total_blocks_found,
+                            blocks_found: &blocks_found,
+                        });
+                        println!(
+                            "[MINER] SOLVED block {} | nonce={} | submit={}",
+                            template.block_height,
+                            nonce,
+                            blocks_found
+                                .first()
+                                .map(|block| block.status.as_str())
+                                .unwrap_or("unknown")
+                        );
                     }
                 }
                 Err(err) => {
@@ -271,10 +311,11 @@ fn main() {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let count = checked.load(Ordering::Relaxed);
                     if last_status.elapsed() >= STATUS_INTERVAL {
-                        let elapsed = started.elapsed().as_secs_f64();
                         let interval = last_status.elapsed().as_secs_f64();
                         let instant_rate = (count.saturating_sub(last_count)) as f64 / interval;
-                        let average_rate = count as f64 / elapsed.max(0.001);
+                        let global_checked = total_checked.saturating_add(count);
+                        let average_rate = global_checked as f64
+                            / miner_started.elapsed().as_secs_f64().max(0.001);
                         let expected = expected_hashes(template.difficulty_bits);
                         let eta = if average_rate > 0.0 {
                             expected / average_rate
@@ -282,20 +323,24 @@ fn main() {
                             f64::INFINITY
                         };
 
-                        print!(
-                            "\r[MINER] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
-                            template.block_height,
-                            format_target(template.difficulty_bits),
-                            format_hashes(count as f64),
-                            format_rate(instant_rate),
-                            format_rate(average_rate),
-                            format_duration(elapsed),
-                            format_duration(eta),
-                            first_nonce
-                                .map(|nonce| nonce.to_string())
-                                .unwrap_or_else(|| "pending".to_string())
-                        );
-                        let _ = io::stdout().flush();
+                        if last_dashboard.elapsed() >= STATUS_INTERVAL {
+                            render_dashboard(&Dashboard {
+                                mode: "CPU",
+                                device: format!("{workers} threads"),
+                                endpoint: &active_endpoint_label,
+                                block_height: template.block_height,
+                                target_bits: template.difficulty_bits,
+                                current_rate: instant_rate,
+                                average_rate,
+                                checked: global_checked,
+                                elapsed: miner_started.elapsed().as_secs_f64(),
+                                eta,
+                                start_nonce: first_nonce.unwrap_or(0),
+                                total_blocks_found,
+                                blocks_found: &blocks_found,
+                            });
+                            last_dashboard = Instant::now();
+                        }
                         last_status = Instant::now();
                         last_count = count;
                     }
@@ -310,32 +355,49 @@ fn main() {
         for handle in handles {
             let _ = handle.join();
         }
-        println!();
+        total_checked = total_checked.saturating_add(checked.load(Ordering::Relaxed));
 
         if let Some(nonce) = winning_nonce {
-            println!(
-                "[MINER] SOLVED block {} | nonce={} | checked={} | elapsed={} | avg={}",
-                template.block_height,
-                nonce,
-                format_hashes(checked.load(Ordering::Relaxed) as f64),
-                format_duration(started.elapsed().as_secs_f64()),
-                format_rate(
-                    checked.load(Ordering::Relaxed) as f64
-                        / started.elapsed().as_secs_f64().max(0.001),
-                )
-            );
-            match submit_nonce(&endpoint, &wallet_hex, nonce) {
+            total_blocks_found = total_blocks_found.saturating_add(1);
+            let submit_status = match submit_nonce(&endpoint, &wallet_hex, nonce) {
                 Ok(body) => {
                     let lower = body.to_ascii_lowercase();
                     if lower.contains("accepted") || lower.contains("ok") || lower.contains("true")
                     {
-                        println!("[MINER] SUBMIT accepted: {body}");
+                        "accepted".to_string()
                     } else {
-                        println!("[MINER] SUBMIT response: {body}");
+                        format!("response: {}", compact_status(&body))
                     }
                 }
-                Err(err) => eprintln!("[MINER] Failed to submit - node unreachable - {err}"),
-            }
+                Err(err) => format!("submit failed: {err}"),
+            };
+            blocks_found.insert(
+                0,
+                FoundBlock {
+                    block_height: template.block_height,
+                    nonce,
+                    status: submit_status,
+                },
+            );
+            blocks_found.truncate(8);
+
+            let avg_rate = total_checked as f64 / miner_started.elapsed().as_secs_f64().max(0.001);
+            render_dashboard(&Dashboard {
+                mode: "CPU",
+                device: format!("{workers} threads"),
+                endpoint: &active_endpoint_label,
+                block_height: template.block_height,
+                target_bits: template.difficulty_bits,
+                current_rate: checked.load(Ordering::Relaxed) as f64
+                    / started.elapsed().as_secs_f64().max(0.001),
+                average_rate: avg_rate,
+                checked: total_checked,
+                elapsed: miner_started.elapsed().as_secs_f64(),
+                eta: expected_hashes(template.difficulty_bits) / avg_rate.max(0.001),
+                start_nonce: first_nonce.unwrap_or(0),
+                total_blocks_found,
+                blocks_found: &blocks_found,
+            });
         }
     }
 }
@@ -343,6 +405,95 @@ fn main() {
 enum MinerEvent {
     StartedAt(u64),
     Found(u64),
+}
+
+struct FoundBlock {
+    block_height: u64,
+    nonce: u64,
+    status: String,
+}
+
+struct Dashboard<'a> {
+    mode: &'a str,
+    device: String,
+    endpoint: &'a str,
+    block_height: u64,
+    target_bits: u32,
+    current_rate: f64,
+    average_rate: f64,
+    checked: u64,
+    elapsed: f64,
+    eta: f64,
+    start_nonce: u64,
+    total_blocks_found: u64,
+    blocks_found: &'a [FoundBlock],
+}
+
+fn render_dashboard(dashboard: &Dashboard) {
+    print!("\x1b[2J\x1b[H");
+    println!("QL MINER - SRB STYLE STATUS");
+    println!("==============================================================");
+    println!("{:<18} {:<18} {:<18}", "Mode", "Device", "RPC Endpoint");
+    println!(
+        "{:<18} {:<18} {:<18}",
+        dashboard.mode, dashboard.device, dashboard.endpoint
+    );
+    println!("--------------------------------------------------------------");
+    println!(
+        "{:<14} {:<18} {:<18} {:<18}",
+        "Block", "Target", "Current H/s", "Average H/s"
+    );
+    println!(
+        "{:<14} {:<18} {:<18} {:<18}",
+        dashboard.block_height,
+        format!("{} bits", dashboard.target_bits),
+        format_rate(dashboard.current_rate),
+        format_rate(dashboard.average_rate)
+    );
+    println!("--------------------------------------------------------------");
+    println!(
+        "{:<18} {:<18} {:<18} {:<18}",
+        "Checked", "ETA", "Uptime", "Start Nonce"
+    );
+    println!(
+        "{:<18} {:<18} {:<18} {:<18}",
+        format_hashes(dashboard.checked as f64),
+        format_duration(dashboard.eta),
+        format_duration(dashboard.elapsed),
+        dashboard.start_nonce
+    );
+    println!("--------------------------------------------------------------");
+    println!("Blocks Found: {}", dashboard.total_blocks_found);
+    println!("{:<10} {:<22} {:<28}", "Block", "Nonce", "Status");
+    if dashboard.blocks_found.is_empty() {
+        println!("{:<10} {:<22} {:<28}", "-", "-", "none yet");
+    } else {
+        for block in dashboard.blocks_found.iter().take(8) {
+            println!(
+                "{:<10} {:<22} {:<28}",
+                block.block_height,
+                block.nonce,
+                truncate_for_table(&block.status, 28)
+            );
+        }
+    }
+    println!("==============================================================");
+    println!("Ctrl+C to stop. Dashboard refreshes in-place.");
+    let _ = io::stdout().flush();
+}
+
+fn compact_status(status: &str) -> String {
+    status.split_whitespace().collect::<Vec<&str>>().join(" ")
+}
+
+fn truncate_for_table(value: &str, max_len: usize) -> String {
+    if value.len() <= max_len {
+        value.to_string()
+    } else if max_len <= 3 {
+        value[..max_len].to_string()
+    } else {
+        format!("{}...", &value[..max_len - 3])
+    }
 }
 
 struct CudaBatchResult {

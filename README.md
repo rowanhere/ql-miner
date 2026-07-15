@@ -44,10 +44,10 @@ To mine on an NVIDIA GPU:
 ./target/release/ql-miner-multicore --cuda --cuda-device 0 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
 ```
 
-The miner prints a live status line with block number, target difficulty,
-checked hashes, current H/s, average H/s, elapsed time, rough ETA, and the
-starting nonce. When it finds a match it prints a `SOLVED` line before
-submitting the nonce.
+The miner prints a clear terminal dashboard for SSH/VPS sessions, with block
+height, block target, current hashrate, average hashrate, checked hashes, ETA,
+uptime, and a latest-blocks-found table. When it finds a match it prints a
+`SOLVED` line after submitting the nonce.
 
 Use the same bare `NODE_ADDRESS:PORT` shape as the original binary. The original
 binary does not require typing `http://` or `https://`; it opens the connection
