@@ -10,6 +10,16 @@ cd ql-miner-multicore
 cargo build --release
 ```
 
+CUDA build, for NVIDIA GPUs:
+
+```bash
+cargo build --release --features cuda
+```
+
+The CUDA build requires the NVIDIA CUDA toolkit and `nvcc`. It is pure CUDA for
+the GPU mining kernel; the Rust host code still handles node RPC and nonce
+submission.
+
 The binary will be created at:
 
 ```bash
@@ -26,6 +36,12 @@ By default it uses all detected CPU threads. To pick a worker count:
 
 ```bash
 ./target/release/ql-miner-multicore -j 32 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
+```
+
+To mine on an NVIDIA GPU:
+
+```bash
+./target/release/ql-miner-multicore --cuda --cuda-device 0 NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX
 ```
 
 The miner prints a live status line with block number, target difficulty,
@@ -47,6 +63,13 @@ Quick script:
 ```bash
 chmod +x run-vps.sh
 ./run-vps.sh
+```
+
+CUDA script:
+
+```bash
+chmod +x run-vps.sh
+./run-vps.sh --cuda
 ```
 
 Manual command:

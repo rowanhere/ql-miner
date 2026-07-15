@@ -13,8 +13,28 @@ use std::time::{Duration, Instant};
 
 const WALLET_HEX_LEN: usize = 3904;
 const BATCH_PER_WORKER: u64 = 1_000_000;
+const CUDA_BATCH_NONCES: u64 = 64_000_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn ql_cuda_mine(
+        previous_hash: *const u8,
+        previous_hash_len: usize,
+        merkle_root: *const u8,
+        merkle_root_len: usize,
+        block_height: u64,
+        wallet: *const u8,
+        wallet_len: usize,
+        difficulty_bits: u32,
+        start_nonce: u64,
+        total_nonces: u64,
+        found_nonce: *mut u64,
+        checked: *mut u64,
+        device_id: i32,
+    ) -> i32;
+}
 
 #[derive(Clone)]
 struct Template {
@@ -38,26 +58,57 @@ fn default_difficulty_bits() -> u32 {
 }
 
 fn usage() -> ! {
-    eprintln!("Usage: ql-miner-multicore [-j WORKERS] NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX");
+    eprintln!(
+        "Usage: ql-miner-multicore [--cuda] [--cuda-device ID] [-j WORKERS] NODE_ADDRESS:PORT YOUR_WALLET_ADDRESS_HEX"
+    );
     std::process::exit(2);
 }
 
 fn main() {
-    let mut args = env::args().skip(1);
+    let args = env::args().skip(1).collect::<Vec<String>>();
     let mut workers = num_cpus::get();
-    let first = args.next().unwrap_or_else(|| usage());
+    let mut cuda_enabled = false;
+    let mut cuda_device = 0i32;
+    let mut positional = Vec::new();
 
-    let node = if first == "-j" || first == "--threads" {
-        let count = args.next().unwrap_or_else(|| usage());
-        workers = count.parse::<usize>().unwrap_or_else(|_| usage()).max(1);
-        args.next().unwrap_or_else(|| usage())
-    } else {
-        first
-    };
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-j" | "--threads" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                workers = args[i].parse::<usize>().unwrap_or_else(|_| usage()).max(1);
+            }
+            "--cuda" => cuda_enabled = true,
+            "--cuda-device" => {
+                i += 1;
+                if i >= args.len() {
+                    usage();
+                }
+                cuda_device = args[i].parse::<i32>().unwrap_or_else(|_| usage());
+            }
+            "-h" | "--help" => usage(),
+            value => positional.push(value.to_string()),
+        }
+        i += 1;
+    }
 
-    let wallet_hex = args.next().unwrap_or_else(|| usage());
-    if args.next().is_some() || wallet_hex.len() != WALLET_HEX_LEN {
+    if positional.len() != 2 {
         usage();
+    }
+    let node = positional.remove(0);
+    let wallet_hex = positional.remove(0);
+    if wallet_hex.len() != WALLET_HEX_LEN {
+        usage();
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    if cuda_enabled {
+        eprintln!("[MINER] CUDA requested, but this binary was built without --features cuda.");
+        eprintln!("[MINER] Build it with: cargo build --release --features cuda");
+        std::process::exit(2);
     }
 
     let wallet = hex::decode(&wallet_hex).unwrap_or_else(|_| {
@@ -78,7 +129,11 @@ fn main() {
     });
     println!("[CONFIG] Connecting to node: {node}");
     println!("[MINER] Mining rewards will be paid to: {wallet_hex}");
-    println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
+    if cuda_enabled {
+        println!("[MINER] Using CUDA device {cuda_device}. Press Ctrl+C to stop.");
+    } else {
+        println!("[MINER] Using {workers} worker thread(s). Press Ctrl+C to stop.");
+    }
 
     let mut active_endpoint_label = String::new();
     let mut active_block = None;
@@ -108,6 +163,58 @@ fn main() {
                 format_hashes(expected_hashes(template.difficulty_bits))
             );
             active_block = Some(block_key);
+        }
+
+        if cuda_enabled {
+            match mine_cuda_batch(&template, &wallet, cuda_device) {
+                Ok(result) => {
+                    print!(
+                        "\r[CUDA] block={} target={} checked={} rate={} avg={} elapsed={} eta~{} start_nonce={}",
+                        template.block_height,
+                        format_target(template.difficulty_bits),
+                        format_hashes(result.checked as f64),
+                        format_rate(result.rate),
+                        format_rate(result.rate),
+                        format_duration(result.elapsed),
+                        format_duration(expected_hashes(template.difficulty_bits) / result.rate.max(0.001)),
+                        result.start_nonce
+                    );
+                    let _ = io::stdout().flush();
+
+                    if let Some(nonce) = result.nonce {
+                        println!();
+                        println!(
+                            "[MINER] SOLVED block {} | nonce={} | checked={} | elapsed={} | avg={}",
+                            template.block_height,
+                            nonce,
+                            format_hashes(result.checked as f64),
+                            format_duration(result.elapsed),
+                            format_rate(result.rate),
+                        );
+                        match submit_nonce(&endpoint, &wallet_hex, nonce) {
+                            Ok(body) => {
+                                let lower = body.to_ascii_lowercase();
+                                if lower.contains("accepted")
+                                    || lower.contains("ok")
+                                    || lower.contains("true")
+                                {
+                                    println!("[MINER] SUBMIT accepted: {body}");
+                                } else {
+                                    println!("[MINER] SUBMIT response: {body}");
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("[MINER] Failed to submit - node unreachable - {err}")
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[CUDA] {err}");
+                    sleep_or_stop(&stop, Duration::from_secs(5));
+                }
+            }
+            continue;
         }
 
         let started = Instant::now();
@@ -238,6 +345,75 @@ fn main() {
 enum MinerEvent {
     StartedAt(u64),
     Found(u64),
+}
+
+struct CudaBatchResult {
+    nonce: Option<u64>,
+    checked: u64,
+    elapsed: f64,
+    rate: f64,
+    start_nonce: u64,
+}
+
+#[cfg(feature = "cuda")]
+fn mine_cuda_batch(
+    template: &Template,
+    wallet: &[u8],
+    device_id: i32,
+) -> Result<CudaBatchResult, String> {
+    let mut rng = rand::thread_rng();
+    let start_nonce = rng.next_u64();
+    let started = Instant::now();
+    let mut found_nonce = 0u64;
+    let mut checked = 0u64;
+
+    let status = unsafe {
+        ql_cuda_mine(
+            template.previous_block_hash.as_ptr(),
+            template.previous_block_hash.len(),
+            template.merkle_root.as_ptr(),
+            template.merkle_root.len(),
+            template.block_height,
+            wallet.as_ptr(),
+            wallet.len(),
+            template.difficulty_bits,
+            start_nonce,
+            CUDA_BATCH_NONCES,
+            &mut found_nonce,
+            &mut checked,
+            device_id,
+        )
+    };
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let rate = checked as f64 / elapsed.max(0.001);
+
+    match status {
+        1 => Ok(CudaBatchResult {
+            nonce: Some(found_nonce),
+            checked,
+            elapsed,
+            rate,
+            start_nonce,
+        }),
+        0 => Ok(CudaBatchResult {
+            nonce: None,
+            checked,
+            elapsed,
+            rate,
+            start_nonce,
+        }),
+        code => Err(format!("CUDA miner failed with code {code}")),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn mine_cuda_batch(
+    _template: &Template,
+    _wallet: &[u8],
+    _device_id: i32,
+) -> Result<CudaBatchResult, String> {
+    Err("CUDA support is not compiled into this binary".to_string())
 }
 
 #[derive(Clone)]
