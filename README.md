@@ -36,8 +36,9 @@ submitting the nonce.
 Use the same bare `NODE_ADDRESS:PORT` shape as the original binary. The original
 binary does not require typing `http://` or `https://`; it opens the connection
 itself and sends HTTP/1.1 requests to `/api/mining/template` and
-`/api/mining/submit`. For remote hosts this miner tries TLS first, then plain
-HTTP as a fallback.
+`/api/mining/submit`. For remote bare hosts this miner matches the original
+binary's behavior: it tries TLS on port `443` first, then plain HTTP on the
+typed port as a fallback.
 
 ## My VPS Command
 

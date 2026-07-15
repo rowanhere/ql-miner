@@ -291,7 +291,7 @@ fn node_endpoints(node: &str) -> Result<Vec<Endpoint>, String> {
     let tls = Endpoint {
         scheme: Scheme::Tls,
         host: host.clone(),
-        port,
+        port: 443,
     };
 
     if host == "localhost" || host == "127.0.0.1" {
