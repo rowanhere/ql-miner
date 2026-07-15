@@ -35,5 +35,9 @@ fn main() {
         println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
     }
     println!("cargo:rustc-link-lib=cudart");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-lib=stdc++");
+        println!("cargo:rustc-link-lib=gcc_s");
+    }
     println!("cargo:rerun-if-changed=src/cuda_miner.cu");
 }
