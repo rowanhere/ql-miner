@@ -16,6 +16,8 @@ const BATCH_PER_WORKER: u64 = 1_000_000;
 const CUDA_BATCH_NONCES: u64 = 1_024_000_000;
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBMIT_RETRIES: usize = 6;
+const SUBMIT_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
 
 #[cfg(feature = "cuda")]
 extern "C" {
@@ -196,20 +198,7 @@ fn main() {
 
                     if let Some(nonce) = result.nonce {
                         total_blocks_found = total_blocks_found.saturating_add(1);
-                        let submit_status = match submit_nonce(&endpoint, &wallet_hex, nonce) {
-                            Ok(body) => {
-                                let lower = body.to_ascii_lowercase();
-                                if lower.contains("accepted")
-                                    || lower.contains("ok")
-                                    || lower.contains("true")
-                                {
-                                    "accepted".to_string()
-                                } else {
-                                    format!("response: {}", compact_status(&body))
-                                }
-                            }
-                            Err(err) => format!("submit failed: {err}"),
-                        };
+                        let submit_status = submit_nonce_with_retry(&endpoint, &wallet_hex, nonce);
 
                         blocks_found.insert(
                             0,
@@ -359,18 +348,7 @@ fn main() {
 
         if let Some(nonce) = winning_nonce {
             total_blocks_found = total_blocks_found.saturating_add(1);
-            let submit_status = match submit_nonce(&endpoint, &wallet_hex, nonce) {
-                Ok(body) => {
-                    let lower = body.to_ascii_lowercase();
-                    if lower.contains("accepted") || lower.contains("ok") || lower.contains("true")
-                    {
-                        "accepted".to_string()
-                    } else {
-                        format!("response: {}", compact_status(&body))
-                    }
-                }
-                Err(err) => format!("submit failed: {err}"),
-            };
+            let submit_status = submit_nonce_with_retry(&endpoint, &wallet_hex, nonce);
             blocks_found.insert(
                 0,
                 FoundBlock {
@@ -676,6 +654,46 @@ fn submit_nonce(endpoint: &Endpoint, wallet: &str, nonce: u64) -> Result<String,
     .to_string();
 
     rpc_request(endpoint, "POST", "/api/mining/submit", Some(&body))
+}
+
+fn submit_nonce_with_retry(endpoint: &Endpoint, wallet: &str, nonce: u64) -> String {
+    let mut last_error = String::new();
+
+    for attempt in 1..=SUBMIT_RETRIES {
+        match submit_nonce(endpoint, wallet, nonce) {
+            Ok(body) => return classify_submit_body(&body),
+            Err(err) => {
+                last_error = err;
+                if !is_rate_limited(&last_error) || attempt == SUBMIT_RETRIES {
+                    break;
+                }
+
+                let delay = SUBMIT_RETRY_BASE_DELAY * attempt as u32;
+                eprintln!(
+                    "[MINER] Submit rate-limited for nonce {nonce}; retry {}/{} in {}",
+                    attempt + 1,
+                    SUBMIT_RETRIES,
+                    format_duration(delay.as_secs_f64())
+                );
+                thread::sleep(delay);
+            }
+        }
+    }
+
+    format!("submit failed: {}", compact_status(&last_error))
+}
+
+fn classify_submit_body(body: &str) -> String {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("accepted") || lower.contains("ok") || lower.contains("true") {
+        "accepted".to_string()
+    } else {
+        format!("response: {}", compact_status(body))
+    }
+}
+
+fn is_rate_limited(error: &str) -> bool {
+    error.contains("HTTP 429")
 }
 
 fn rpc_request(
