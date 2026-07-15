@@ -11,12 +11,14 @@ fn main() {
     let object = out_dir.join("cuda_miner.o");
     let cuda_arch = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
     let cuda_threads = env::var("CUDA_THREADS").unwrap_or_else(|_| "256".to_string());
+    let cuda_min_blocks = env::var("CUDA_MIN_BLOCKS").unwrap_or_else(|_| "1".to_string());
 
     let mut nvcc = Command::new("nvcc");
     nvcc.arg("-O3")
         .arg("-arch")
         .arg(&cuda_arch)
         .arg(format!("-DQL_CUDA_THREADS={cuda_threads}"))
+        .arg(format!("-DQL_CUDA_MIN_BLOCKS={cuda_min_blocks}"))
         .arg("-Xcompiler")
         .arg("-fPIC");
 
@@ -50,5 +52,6 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_miner.cu");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_THREADS");
+    println!("cargo:rerun-if-env-changed=CUDA_MIN_BLOCKS");
     println!("cargo:rerun-if-env-changed=CUDA_MAXRREGCOUNT");
 }

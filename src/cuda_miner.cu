@@ -6,6 +6,10 @@
 #define QL_CUDA_THREADS 256
 #endif
 
+#ifndef QL_CUDA_MIN_BLOCKS
+#define QL_CUDA_MIN_BLOCKS 1
+#endif
+
 static __constant__ uint64_t PREFIX_STATE[25];
 
 static __host__ __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
@@ -139,6 +143,25 @@ static __host__ __device__ void absorb_u64_le(uint64_t s[25], uint32_t &pos, uin
 }
 
 static __device__ bool has_leading_zero_bits(uint64_t s[25], uint32_t bits) {
+    if (bits <= 64) {
+        if (bits == 0) {
+            return true;
+        }
+
+        uint32_t full_bytes = bits >> 3;
+        uint32_t extra_bits = bits & 7;
+        uint64_t mask = 0;
+
+        if (full_bytes != 0) {
+            mask = (full_bytes == 8) ? 0xffffffffffffffffULL : ((1ULL << (full_bytes * 8)) - 1ULL);
+        }
+        if (extra_bits != 0) {
+            mask |= ((uint64_t)(0xffu << (8 - extra_bits)) & 0xffULL) << (full_bytes * 8);
+        }
+
+        return (s[0] & mask) == 0;
+    }
+
     uint32_t full_bytes = bits >> 3;
     uint32_t extra_bits = bits & 7;
 
@@ -190,7 +213,7 @@ static __device__ __forceinline__ bool valid_nonce_gpu(
     return has_leading_zero_bits(s, difficulty_bits);
 }
 
-__global__ void mine_kernel(
+__global__ __launch_bounds__(QL_CUDA_THREADS, QL_CUDA_MIN_BLOCKS) void mine_kernel(
     uint32_t prefix_pos,
     uint32_t difficulty_bits,
     uint64_t start_nonce,
