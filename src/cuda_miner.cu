@@ -2,22 +2,40 @@
 #include <stdint.h>
 #include <stddef.h>
 
-static __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
+static __host__ __device__ __forceinline__ uint64_t rotl64(uint64_t x, int n) {
     return (x << n) | (x >> (64 - n));
 }
 
-static __constant__ uint64_t KECCAK_RC[24] = {
-    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL,
-    0x8000000080008000ULL, 0x000000000000808bULL, 0x0000000080000001ULL,
-    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008aULL,
-    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
-    0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL,
-    0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
-    0x000000000000800aULL, 0x800000008000000aULL, 0x8000000080008081ULL,
-    0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL,
-};
+static __host__ __device__ __forceinline__ uint64_t keccak_rc(int round) {
+    switch (round) {
+        case 0: return 0x0000000000000001ULL;
+        case 1: return 0x0000000000008082ULL;
+        case 2: return 0x800000000000808aULL;
+        case 3: return 0x8000000080008000ULL;
+        case 4: return 0x000000000000808bULL;
+        case 5: return 0x0000000080000001ULL;
+        case 6: return 0x8000000080008081ULL;
+        case 7: return 0x8000000000008009ULL;
+        case 8: return 0x000000000000008aULL;
+        case 9: return 0x0000000000000088ULL;
+        case 10: return 0x0000000080008009ULL;
+        case 11: return 0x000000008000000aULL;
+        case 12: return 0x000000008000808bULL;
+        case 13: return 0x800000000000008bULL;
+        case 14: return 0x8000000000008089ULL;
+        case 15: return 0x8000000000008003ULL;
+        case 16: return 0x8000000000008002ULL;
+        case 17: return 0x8000000000000080ULL;
+        case 18: return 0x000000000000800aULL;
+        case 19: return 0x800000008000000aULL;
+        case 20: return 0x8000000080008081ULL;
+        case 21: return 0x8000000000008080ULL;
+        case 22: return 0x0000000080000001ULL;
+        default: return 0x8000000080008008ULL;
+    }
+}
 
-static __device__ void keccak_f1600(uint64_t s[25]) {
+static __host__ __device__ void keccak_f1600(uint64_t s[25]) {
     for (int round = 0; round < 24; ++round) {
         uint64_t c[5], d[5], b[25];
 
@@ -81,11 +99,11 @@ static __device__ void keccak_f1600(uint64_t s[25]) {
             s[row + 4] = x4 ^ ((~x0) & x1);
         }
 
-        s[0] ^= KECCAK_RC[round];
+        s[0] ^= keccak_rc(round);
     }
 }
 
-static __device__ __forceinline__ void absorb_byte(uint64_t s[25], uint32_t &pos, uint8_t byte) {
+static __host__ __device__ __forceinline__ void absorb_byte(uint64_t s[25], uint32_t &pos, uint8_t byte) {
     const uint32_t rate = 136;
     s[pos >> 3] ^= ((uint64_t)byte) << ((pos & 7) * 8);
     ++pos;
@@ -95,20 +113,20 @@ static __device__ __forceinline__ void absorb_byte(uint64_t s[25], uint32_t &pos
     }
 }
 
-static __device__ void absorb_bytes(uint64_t s[25], uint32_t &pos, const uint8_t *data, size_t len) {
+static __host__ __device__ void absorb_bytes(uint64_t s[25], uint32_t &pos, const uint8_t *data, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         absorb_byte(s, pos, data[i]);
     }
 }
 
-static __device__ void absorb_u32_le(uint64_t s[25], uint32_t &pos, uint32_t value) {
+static __host__ __device__ void absorb_u32_le(uint64_t s[25], uint32_t &pos, uint32_t value) {
     absorb_byte(s, pos, (uint8_t)(value));
     absorb_byte(s, pos, (uint8_t)(value >> 8));
     absorb_byte(s, pos, (uint8_t)(value >> 16));
     absorb_byte(s, pos, (uint8_t)(value >> 24));
 }
 
-static __device__ void absorb_u64_le(uint64_t s[25], uint32_t &pos, uint64_t value) {
+static __host__ __device__ void absorb_u64_le(uint64_t s[25], uint32_t &pos, uint64_t value) {
     for (int i = 0; i < 8; ++i) {
         absorb_byte(s, pos, (uint8_t)(value >> (i * 8)));
     }
@@ -127,28 +145,18 @@ static __device__ bool has_leading_zero_bits(uint64_t s[25], uint32_t bits) {
 }
 
 static __device__ bool valid_nonce_gpu(
-    const uint8_t *previous_hash,
-    size_t previous_hash_len,
-    const uint8_t *merkle_root,
-    size_t merkle_root_len,
-    uint64_t block_height,
-    const uint8_t *wallet,
-    size_t wallet_len,
+    const uint64_t *prefix_state,
+    uint32_t prefix_pos,
     uint64_t nonce,
     uint32_t difficulty_bits
 ) {
     uint64_t s[25];
     #pragma unroll
     for (int i = 0; i < 25; ++i) {
-        s[i] = 0;
+        s[i] = prefix_state[i];
     }
 
-    uint32_t pos = 0;
-    absorb_u32_le(s, pos, 1);
-    absorb_bytes(s, pos, previous_hash, previous_hash_len);
-    absorb_bytes(s, pos, merkle_root, merkle_root_len);
-    absorb_u64_le(s, pos, block_height);
-    absorb_bytes(s, pos, wallet, wallet_len);
+    uint32_t pos = prefix_pos;
     absorb_u64_le(s, pos, nonce);
 
     s[pos >> 3] ^= ((uint64_t)0x06) << ((pos & 7) * 8);
@@ -159,13 +167,8 @@ static __device__ bool valid_nonce_gpu(
 }
 
 __global__ void mine_kernel(
-    const uint8_t *previous_hash,
-    size_t previous_hash_len,
-    const uint8_t *merkle_root,
-    size_t merkle_root_len,
-    uint64_t block_height,
-    const uint8_t *wallet,
-    size_t wallet_len,
+    const uint64_t *prefix_state,
+    uint32_t prefix_pos,
     uint32_t difficulty_bits,
     uint64_t start_nonce,
     uint64_t total_nonces,
@@ -182,13 +185,8 @@ __global__ void mine_kernel(
 
         uint64_t nonce = start_nonce + index;
         if (valid_nonce_gpu(
-                previous_hash,
-                previous_hash_len,
-                merkle_root,
-                merkle_root_len,
-                block_height,
-                wallet,
-                wallet_len,
+                prefix_state,
+                prefix_pos,
                 nonce,
                 difficulty_bits
             )) {
@@ -219,23 +217,28 @@ extern "C" int ql_cuda_mine(
         return -1;
     }
 
-    uint8_t *d_previous_hash = nullptr;
-    uint8_t *d_merkle_root = nullptr;
-    uint8_t *d_wallet = nullptr;
+    uint64_t prefix_state[25];
+    uint32_t prefix_pos = 0;
+    for (int i = 0; i < 25; ++i) {
+        prefix_state[i] = 0;
+    }
+    absorb_u32_le(prefix_state, prefix_pos, 1);
+    absorb_bytes(prefix_state, prefix_pos, previous_hash, previous_hash_len);
+    absorb_bytes(prefix_state, prefix_pos, merkle_root, merkle_root_len);
+    absorb_u64_le(prefix_state, prefix_pos, block_height);
+    absorb_bytes(prefix_state, prefix_pos, wallet, wallet_len);
+
+    uint64_t *d_prefix_state = nullptr;
     unsigned long long *d_found_nonce = nullptr;
     int *d_found_flag = nullptr;
 
-    if (cudaMalloc(&d_previous_hash, previous_hash_len) != cudaSuccess) return -2;
-    if (cudaMalloc(&d_merkle_root, merkle_root_len) != cudaSuccess) return -3;
-    if (cudaMalloc(&d_wallet, wallet_len) != cudaSuccess) return -4;
-    if (cudaMalloc(&d_found_nonce, sizeof(unsigned long long)) != cudaSuccess) return -5;
-    if (cudaMalloc(&d_found_flag, sizeof(int)) != cudaSuccess) return -6;
+    if (cudaMalloc((void **)&d_prefix_state, sizeof(prefix_state)) != cudaSuccess) return -2;
+    if (cudaMalloc((void **)&d_found_nonce, sizeof(unsigned long long)) != cudaSuccess) return -5;
+    if (cudaMalloc((void **)&d_found_flag, sizeof(int)) != cudaSuccess) return -6;
 
     int zero = 0;
     unsigned long long zero_nonce = 0;
-    cudaMemcpy(d_previous_hash, previous_hash, previous_hash_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_merkle_root, merkle_root, merkle_root_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_wallet, wallet, wallet_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_prefix_state, prefix_state, sizeof(prefix_state), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_found_nonce, &zero_nonce, sizeof(unsigned long long), cudaMemcpyHostToDevice);
 
@@ -246,13 +249,8 @@ extern "C" int ql_cuda_mine(
     int blocks = (int)blocks64;
 
     mine_kernel<<<blocks, threads>>>(
-        d_previous_hash,
-        previous_hash_len,
-        d_merkle_root,
-        merkle_root_len,
-        block_height,
-        d_wallet,
-        wallet_len,
+        d_prefix_state,
+        prefix_pos,
         difficulty_bits,
         start_nonce,
         total_nonces,
@@ -262,9 +260,7 @@ extern "C" int ql_cuda_mine(
 
     cudaError_t launch_status = cudaGetLastError();
     if (launch_status != cudaSuccess) {
-        cudaFree(d_previous_hash);
-        cudaFree(d_merkle_root);
-        cudaFree(d_wallet);
+        cudaFree(d_prefix_state);
         cudaFree(d_found_nonce);
         cudaFree(d_found_flag);
         return -7;
@@ -272,9 +268,7 @@ extern "C" int ql_cuda_mine(
 
     cudaError_t sync_status = cudaDeviceSynchronize();
     if (sync_status != cudaSuccess) {
-        cudaFree(d_previous_hash);
-        cudaFree(d_merkle_root);
-        cudaFree(d_wallet);
+        cudaFree(d_prefix_state);
         cudaFree(d_found_nonce);
         cudaFree(d_found_flag);
         return -8;
@@ -285,9 +279,7 @@ extern "C" int ql_cuda_mine(
     cudaMemcpy(&h_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&h_nonce, d_found_nonce, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_previous_hash);
-    cudaFree(d_merkle_root);
-    cudaFree(d_wallet);
+    cudaFree(d_prefix_state);
     cudaFree(d_found_nonce);
     cudaFree(d_found_flag);
 
